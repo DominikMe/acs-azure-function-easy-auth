@@ -1,111 +1,89 @@
-import { CommunicationAccessToken, CommunicationIdentityClient, CommunicationUserToken, TokenScope } from "@azure/communication-identity";
-import { HttpRequest, HttpResponseInit, InvocationContext, app, input, output } from "@azure/functions";
+import { CommunicationIdentityClient, TokenScope } from "@azure/communication-identity";
+import { TableClient } from "@azure/data-tables";
+import { HttpRequest, HttpResponseInit, InvocationContext, app } from "@azure/functions";
 
 const tokenScopes: TokenScope[] = ["chat", "voip"];
 const minExpiryInMs = 1000 * 60 * 60; // 1 hour
 
 interface TableRow {
-    PartitionKey: string;
-    RowKey: string;
+    IdentityProvider: string;
     AcsUserId: string;
     AcsUserToken: string;
     AcsUserTokenExpiry: string;
 }
 
-const tableInput = input.table({
-    tableName: 'UserMappings',
-    connection: 'TableStorageConnectionString',
-    partitionKey: '{headers.x-zumo-auth}',
-    rowKey: '{headers.x-zumo-auth}'
-});
-
-const tableOutput = output.table({
-    tableName: 'UserMappings',
-    connection: 'TableStorageConnectionString'
-});
-
 export async function exchangeForAcsToken(request: HttpRequest, context: InvocationContext): Promise<HttpResponseInit> {
     context.log(`Http function processed request for url "${request.url}"`);
 
-    const rows = context.extraInputs.get(tableInput) as TableRow[];
-    const minExpiry = new Date(Date.now() + minExpiryInMs);
-
-    if (rows.length > 1) {
+    const easyAuthUserId = request.headers.get('X-MS-CLIENT-PRINCIPAL-ID');
+    const identityProvider = request.headers.get('X-MS-CLIENT-PRINCIPAL-IDP');
+    if (!easyAuthUserId || !identityProvider) {
         return {
-            status: 500,
-            body: "Found more than user entry!"
+            status: 401,
+            body: "Azure Function Easy Auth headers not found."
         }
     }
 
-    let isNewUser = false;
-    let AcsUserId = "";
-    let AcsUserToken = "";
-    let AcsUserTokenExpiry = "";
-
-    if (rows.length === 1) {
-        AcsUserId = rows[0].AcsUserId;
-        AcsUserToken = rows[0].AcsUserToken;
-    }
+    const identityClient = new CommunicationIdentityClient(process.env.CommunicationConnectionString);
+    const tableClient = TableClient.fromConnectionString(process.env.TableStorageConnectionString, 'UserMappings', {
+        allowInsecureConnection: process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0"
+    });
+    await tableClient.createTable();
     
-    const easyAuthUserId = request.headers.get('x-zumo-auth');
+    let isNewUser = false;
+    let tokenFromCache = true;
+    let userRecord: TableRow | undefined = undefined;
 
-    if (!AcsUserId) {
-        const { expiresOn, token, user} = await createAcsUserAndToken();
-        
-        AcsUserId = user.communicationUserId;
-        AcsUserToken = token;
-        AcsUserTokenExpiry = expiresOn.toISOString();
-
-        context.extraOutputs.set(tableOutput, {
-            PartitionKey: easyAuthUserId,
-            RowKey: easyAuthUserId,
-            AcsUserId,
-            AcsUserToken,
-            AcsUserTokenExpiry
-        });
-
-        isNewUser = true;
+    try {
+        userRecord = await tableClient.getEntity<TableRow>(easyAuthUserId, easyAuthUserId);    
+    }
+    catch {
+        console.log("User not found in table storage");
     }
 
-    if (!AcsUserToken || new Date(AcsUserTokenExpiry) < minExpiry) {
-        const { expiresOn, token } = await issueAcsToken(AcsUserId);
+    if (!userRecord || !userRecord.AcsUserId) {
+        const { expiresOn, token, user} = await identityClient.createUserAndToken(tokenScopes);
         
-        AcsUserToken = token;
-        AcsUserTokenExpiry = expiresOn.toISOString();
+        userRecord = {
+            IdentityProvider: identityProvider,
+            AcsUserId: user.communicationUserId,
+            AcsUserToken: token,
+            AcsUserTokenExpiry: expiresOn.toISOString()
+        };
+        isNewUser = true;
+        tokenFromCache = false;
+    }
 
-        context.extraOutputs.set(tableOutput, {
-            PartitionKey: easyAuthUserId,
-            RowKey: easyAuthUserId,
-            AcsUserId,
-            AcsUserToken,
-            AcsUserTokenExpiry
-        });
+    const minExpiry = new Date(Date.now() + minExpiryInMs);
+    if (!userRecord.AcsUserToken || new Date(userRecord.AcsUserTokenExpiry) < minExpiry) {
+        const { expiresOn, token } = await identityClient.getToken({ communicationUserId: userRecord.AcsUserId }, tokenScopes);
+        
+        userRecord = {
+            IdentityProvider: identityProvider,
+            AcsUserId: userRecord.AcsUserId,
+            AcsUserToken: token,
+            AcsUserTokenExpiry: expiresOn.toISOString()
+        };
+        tokenFromCache = false;
+    }
+
+    if (isNewUser || !tokenFromCache) {
+        await tableClient.upsertEntity({ ...userRecord, partitionKey: easyAuthUserId, rowKey: easyAuthUserId });
     }
 
     return {
         jsonBody: {
-            userId: AcsUserId,
-            token: AcsUserToken,
-            expiresOn: AcsUserTokenExpiry,
-            isNewUser
+            userId: userRecord.AcsUserId,
+            token: userRecord.AcsUserToken,
+            expiresOn: userRecord.AcsUserTokenExpiry,
+            isNewUser,
+            tokenFromCache
         }
     };
 };
 
-const createAcsUserAndToken = async(): Promise<CommunicationUserToken> => {
-    const identityClient = new CommunicationIdentityClient(process.env.CommunicationConnectionString);
-    return await identityClient.createUserAndToken(tokenScopes);
-}
-
-const issueAcsToken = async(userId: string): Promise<CommunicationAccessToken> => {
-    const identityClient = new CommunicationIdentityClient(process.env.CommunicationConnectionString);
-    return await identityClient.getToken({ communicationUserId: userId }, tokenScopes);
-}
-
 app.http('exchangeForAcsToken', {
     methods: ['POST'],
     authLevel: 'anonymous',
-    extraInputs: [tableInput],
-    extraOutputs: [tableOutput],
     handler: exchangeForAcsToken
 });
