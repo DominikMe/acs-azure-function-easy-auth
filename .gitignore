@@ -133,3 +133,5 @@ dist
 __azurite_*
 __blobstorage__
 __queuestorage__
+
+config.js

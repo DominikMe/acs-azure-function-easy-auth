@@ -1,0 +1,101 @@
+<html>
+    <head>
+        <meta charset="utf-8">
+    </head>
+
+    <!-- Change to your the URL of your deployed Azure Function -->
+    <script>
+        var AZURE_FUNCTION_BASE_URL = "YOUR_AZURE_FUNCTION_BASE_URL";
+    </script>
+
+    <body>
+        <!-- Generated via https://developers.google.com/identity/gsi/web/tools/configurator -->
+        <!-- Replace YOUR_GOOGLE_CLIENT_ID with your Google OAuth client id -->
+        <div id="g_id_onload"
+            data-client_id="YOUR_GOOGLE_CLIENT_ID"
+            data-context="signin"
+            data-ux_mode="popup"
+            data-callback="receiveGoogleToken"
+            data-auto_select="true"
+            data-itp_support="true">
+        </div>
+
+        <div class="g_id_signin"
+            data-type="standard"
+            data-shape="rectangular"
+            data-theme="outline"
+            data-text="signin_with"
+            data-size="large"
+            data-logo_alignment="left">
+        </div>
+
+        <!-- Container for the ACS call composite, see https://azure.github.io/communication-ui-library/?path=/docs/use-composite-in-non-react-environment--page#use-composites-in-html  -->
+        <div id="call-composite-container" style="width:900px;height:600px"/>
+    </body>
+
+    <!-- Use a third-party library to decode the Google OAuth2 id token -->
+    <script type="module">
+        import { jwtDecode } from 'https://cdn.skypack.dev/jwt-decode';
+        globalThis.jwtDecode = jwtDecode;
+    </script>
+
+    <!-- Google Sign-In JavaScript library -->
+    <script src="https://accounts.google.com/gsi/client" async></script>
+
+    <!-- Please host callComposite.js yourself when going to production and don't use the github release -->
+    <script src="https://github.com/Azure/communication-ui-library/releases/latest/download/callComposite.js"></script>
+
+    <!-- Main script to handle Google Sign-In and ACS token exchange and render an ACS video call experience -->
+    <script>
+        async function exchangeForAcsToken(googleCredential) {
+            const functionUrl = `${AZURE_FUNCTION_BASE_URL}/api/exchangeForAcsToken`;
+            const functionAuthUrl = `${AZURE_FUNCTION_BASE_URL}/.auth/login/google`;
+
+            // step 1: exchange Google credential for Azure Function authentication token
+            const functionAuthResponse = await fetch(functionAuthUrl, {
+                method: 'POST',
+                mode:'cors',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    id_token: googleCredential
+                })
+            });
+            const { authenticationToken } = await functionAuthResponse.json();
+
+            // step 2: exchange Azure Function authentication token for ACS token
+            const exchangeForAcsTokenResponse = await fetch(functionUrl, {
+                method: 'POST',
+                mode:'cors',
+                headers: {
+                    "x-zumo-auth": authenticationToken,
+                }
+            });
+            return await exchangeForAcsTokenResponse.json();
+        }
+        
+        async function receiveGoogleToken(googleToken) {
+            // hide OneTap fallback sign in button
+            document.getElementsByClassName("g_id_signin")[0].style.display = "none";
+
+            const googleCredential = googleToken.credential;
+            const { name } = globalThis.jwtDecode(googleCredential);
+            const { userId, token } = await exchangeForAcsToken(googleCredential);
+            
+            renderAcsCallComposite(userId, token, name);
+        }
+
+        async function renderAcsCallComposite(userId, token, displayName) {
+            const groupId = "f254125b-dab1-40a2-bae5-ae2bd859ab47"; // you can use any UUID to create or join a group call
+            const callAdapter = await callComposite.loadCallComposite(
+            {
+                userId: { communicationUserId: userId },
+                token,
+                displayName,
+                locator: { groupId }
+            },
+            document.getElementById('call-composite-container'));
+        }
+    </script>
+</html>
